@@ -1,0 +1,41 @@
+all:
+  vars:
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    ansible_become_password: your_password_here"
+
+  hosts:
+    main:
+      ansible_host: your_host_here
+      ansible_user: main
+      hostname: main
+      node_labels:
+        - "node-role.kubernetes.io/master=true"
+        - "node-role.kubernetes.io/control-plane=true"
+
+    worker1:
+      ansible_host: your_host_here
+      ansible_user: worker1
+      hostname: worker1
+      node_labels:
+        - "node-role.kubernetes.io/worker=true"
+
+    worker2:
+      ansible_host: your_host_here
+      ansible_user: worker1  # Fixed username
+      hostname: worker2
+      node_labels:
+        - "node-role.kubernetes.io/worker=true"
+
+  children:
+    masters:
+      hosts:
+        main:
+      vars:
+        rke2_type: server
+        
+    workers:
+      hosts:
+        worker1:
+        worker2:
+      vars:
+        rke2_type: agent

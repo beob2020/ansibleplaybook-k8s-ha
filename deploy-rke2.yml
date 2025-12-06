@@ -1,0 +1,383 @@
+---
+# RKE2 Production Deployment (single control-plane, any # of workers)
+# Works on Ubuntu (incl. Proxmox VMs)
+# Minimal, safe defaults. No custom systemd drop-ins.
+
+- name: Pre-flight checks and OS prep
+  hosts: all
+  become: true
+  vars:
+    desired_hostname: "{{ hostvars[inventory_hostname].hostname | default(inventory_hostname) }}"
+  tasks:
+    - name: Check connectivity
+      ansible.builtin.ping:
+
+    - name: Verify minimum system requirements (>= 2 vCPU, 4GiB RAM)
+      ansible.builtin.assert:
+        that:
+          - ansible_processor_vcpus | int >= 2
+          - ansible_memtotal_mb | int >= 4096
+        fail_msg: "System does not meet minimum requirements (2 vCPU, 4 GiB RAM)."
+
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ desired_hostname }}"
+
+    - name: Ensure /etc/hosts has all nodes
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        create: true
+        line: "{{ hostvars[item].ansible_host }} {{ hostvars[item].hostname | default(item) }}"
+        state: present
+      loop: "{{ groups['all'] | default([]) }}"
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: ansible_swaptotal_mb | int > 0
+
+    - name: Remove swap entries from fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^\s*[^#\n]+\s+none\s+swap\s+'
+        replace: '# (swap disabled for Kubernetes) \g<0>'
+      register: _fstab_swap_disable
+      failed_when: false
+
+    - name: Load kernel modules (overlay, br_netfilter)
+      ansible.builtin.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/rke2.conf
+        mode: '0644'
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Required sysctl settings
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-rke2.conf
+        state: present
+        reload: true
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+- name: Install common dependencies
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 1800
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - ca-certificates
+          - apt-transport-https
+          - gnupg
+          - lsb-release
+          - iptables
+          - conntrack
+          - socat
+          - jq
+          - unzip
+          - tar
+          - nfs-common
+          - open-iscsi
+        state: present
+
+    - name: Start and enable iscsid (ok if absent)
+      ansible.builtin.systemd:
+        name: iscsid
+        state: started
+        enabled: true
+      failed_when: false
+
+    - name: Ensure Docker is not running (RKE2 uses containerd)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+      loop:
+        - docker
+        - docker.socket
+
+# ---------- MASTER ----------
+- name: Install and start RKE2 server (master)
+  hosts: masters
+  become: true
+  vars:
+    rke2_config_file: /etc/rancher/rke2/config.yaml
+    # set these if you want a specific version/channel; otherwise leave empty for latest stable
+    rke2_version: ""
+    rke2_channel: "stable"
+  tasks:
+    - name: Check if RKE2 already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/rke2
+      register: rke2_bin
+
+    - name: Download installer
+      ansible.builtin.get_url:
+        url: https://get.rke2.io
+        dest: /tmp/install_rke2.sh
+        mode: '0755'
+      when: not rke2_bin.stat.exists
+
+    - name: Install RKE2 server
+      ansible.builtin.shell: |
+        INSTALL_RKE2_VERSION="{{ rke2_version }}"
+        INSTALL_RKE2_CHANNEL="{{ rke2_channel }}"
+        INSTALL_RKE2_TYPE="server"
+        /tmp/install_rke2.sh
+      args:
+        creates: /usr/local/bin/rke2
+      when: not rke2_bin.stat.exists
+
+    # Ensure etcd system accounts exist (fixes "unknown user/group etcd")
+    - name: Ensure etcd group exists
+      ansible.builtin.group:
+        name: etcd
+        system: true
+        state: present
+
+    - name: Determine nologin shell
+      ansible.builtin.set_fact:
+        nologin_shell: "{{ '/usr/sbin/nologin' if ansible_facts.os_family == 'Debian' else '/sbin/nologin' }}"
+
+    - name: Ensure etcd user exists
+      ansible.builtin.user:
+        name: etcd
+        system: true
+        shell: "{{ nologin_shell }}"
+        create_home: false
+        group: etcd
+        home: /var/lib/rancher/rke2/server/db
+        state: present
+
+    - name: Ensure etcd data dir exists and owned by etcd
+      ansible.builtin.file:
+        path: /var/lib/rancher/rke2/server/db
+        state: directory
+        owner: etcd
+        group: etcd
+        mode: '0755'
+
+    - name: Create RKE2 config directory
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: '0755'
+
+    - name: Minimal, known-good RKE2 server config
+      ansible.builtin.copy:
+        dest: "{{ rke2_config_file }}"
+        mode: '0644'
+        backup: true
+        content: |
+          write-kubeconfig-mode: "0644"
+          node-name: {{ inventory_hostname }}
+          node-ip: {{ ansible_host }}
+          node-external-ip: {{ ansible_host }}
+          tls-san:
+            - {{ inventory_hostname }}
+            - {{ ansible_host }}
+
+    - name: Make kubectl/helm/crictl available on PATH
+      ansible.builtin.file:
+        src: "/var/lib/rancher/rke2/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: true
+      loop:
+        - kubectl
+        - helm
+        - crictl
+        - nerdctl
+
+    - block:
+        - name: Ensure no custom rke2-server systemd overrides remain
+          ansible.builtin.file:
+            path: /etc/systemd/system/rke2-server.service.d/override.conf
+            state: absent
+
+        - name: Enable and start rke2-server
+          ansible.builtin.systemd:
+            name: rke2-server
+            state: started
+            enabled: true
+            daemon_reload: true
+      rescue:
+        - name: rke2 status
+          ansible.builtin.command: systemctl status --no-pager -l rke2-server
+          register: rke2_status
+          failed_when: false
+        - debug: var=rke2_status.stdout
+        - name: rke2 journal (last 200 lines)
+          ansible.builtin.command: journalctl -u rke2-server -n 200 --no-pager
+          register: rke2_journal
+          failed_when: false
+        - debug: var=rke2_journal.stdout
+        - name: Fail explicitly
+          ansible.builtin.fail:
+            msg: "rke2-server failed to start; see logs above."
+
+    - name: Wait for RKE2 supervisor (9345)
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 9345
+        delay: 5
+        timeout: 300
+
+    - name: Wait for Kubernetes API (6443)
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 6443
+        delay: 5
+        timeout: 300
+
+    - name: Wait for node-token file
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 120
+
+    - name: Read node token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/rke2/server/node-token
+      register: node_token_raw
+
+    - name: Set join facts on master (for reference)
+      ansible.builtin.set_fact:
+        rke2_token: "{{ node_token_raw.content | b64decode | trim }}"
+        rke2_server_url: "https://{{ ansible_host }}:9345"
+
+    - name: Prepare kubeconfig for root
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+
+    - name: Copy kubeconfig to /root/.kube/config
+      ansible.builtin.copy:
+        src: /etc/rancher/rke2/rke2.yaml
+        dest: /root/.kube/config
+        remote_src: true
+        mode: '0600'
+
+    - name: Update kubeconfig server address to node IP
+      ansible.builtin.replace:
+        path: /root/.kube/config
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: "https://{{ ansible_host }}:6443"
+
+# ---------- WORKERS ----------
+- name: Install and join RKE2 workers
+  hosts: workers
+  become: true
+  vars:
+    rke2_config_file: /etc/rancher/rke2/config.yaml
+  tasks:
+    - name: Compute master host (first in group)
+      ansible.builtin.set_fact:
+        master_host: "{{ groups['masters'][0] }}"
+      run_once: true
+
+    - name: Read join token from master
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/rke2/server/node-token
+      register: master_node_token_raw
+      delegate_to: "{{ groups['masters'][0] }}"
+      run_once: true
+
+    - name: Distribute join facts to each worker
+      ansible.builtin.set_fact:
+        rke2_server_url: "https://{{ hostvars[groups['masters'][0]].ansible_host }}:9345"
+        rke2_token: "{{ master_node_token_raw.content | b64decode | trim }}"
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      run_once: true
+      loop: "{{ groups['workers'] }}"
+
+    - name: Check if RKE2 already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/rke2
+      register: rke2_bin
+
+    - name: Download installer
+      ansible.builtin.get_url:
+        url: https://get.rke2.io
+        dest: /tmp/install_rke2.sh
+        mode: '0755'
+      when: not rke2_bin.stat.exists
+
+    - name: Install RKE2 agent
+      ansible.builtin.shell: |
+        INSTALL_RKE2_TYPE="agent" /tmp/install_rke2.sh
+      args:
+        creates: /usr/local/bin/rke2
+      when: not rke2_bin.stat.exists
+
+    - name: Create RKE2 config directory
+      ansible.builtin.file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: '0755'
+
+    - name: Write agent config
+      ansible.builtin.copy:
+        dest: "{{ rke2_config_file }}"
+        mode: '0644'
+        backup: true
+        content: |
+          server: {{ rke2_server_url }}
+          token: {{ rke2_token }}
+          node-name: {{ inventory_hostname }}
+          node-ip: {{ ansible_host }}
+          node-external-ip: {{ ansible_host }}
+
+    - name: Ensure rke2-agent is enabled and started
+      ansible.builtin.systemd:
+        name: rke2-agent
+        state: started
+        enabled: true
+        daemon_reload: true
+
+# ---------- VALIDATION ----------
+- name: Post-deployment checks
+  hosts: masters[0]
+  become: true
+  tasks:
+    - name: Show nodes
+      ansible.builtin.shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: nodes
+      changed_when: false
+
+    - ansible.builtin.debug:
+        var: nodes.stdout_lines
+
+    - name: Show system pods
+      ansible.builtin.shell: kubectl get pods -A
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: pods
+      changed_when: false
+
+    - ansible.builtin.debug:
+        var: pods.stdout_lines
